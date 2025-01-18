@@ -10,6 +10,7 @@ import torch
 from torch import Tensor, nn
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 from tqdm.autonotebook import tqdm, trange
 from transformers import AutoConfig, AutoModelForSequenceClassification, AutoTokenizer, is_torch_npu_available
 from transformers.tokenization_utils_base import BatchEncoding
@@ -190,12 +191,14 @@ class CrossEncoder(PushToHubMixin):
         optimizer_params: dict[str, object] = {"lr": 2e-5},
         weight_decay: float = 0.01,
         evaluation_steps: int = 0,
+        logging_steps: int = 100,
         output_path: str = None,
         save_best_model: bool = True,
         max_grad_norm: float = 1,
         use_amp: bool = False,
         callback: Callable[[float, int, int], None] = None,
         show_progress_bar: bool = True,
+        tensorboard_path: str = None,
     ) -> None:
         """
         Train the model with the given training objective
@@ -215,6 +218,7 @@ class CrossEncoder(PushToHubMixin):
             optimizer_params (Dict[str, object], optional): Optimizer parameters. Defaults to {"lr": 2e-5}.
             weight_decay (float, optional): Weight decay for model parameters. Defaults to 0.01.
             evaluation_steps (int, optional): If > 0, evaluate the model using evaluator after each number of training steps. Defaults to 0.
+            logging_steps (int, optional): write tensorboard after each number of training steps
             output_path (str, optional): Storage path for the model and evaluation files. Defaults to None.
             save_best_model (bool, optional): If true, the best model (according to evaluator) is stored at output_path. Defaults to True.
             max_grad_norm (float, optional): Used for gradient normalization. Defaults to 1.
@@ -223,8 +227,16 @@ class CrossEncoder(PushToHubMixin):
                 It must accept the following three parameters in this order:
                 `score`, `epoch`, `steps`. Defaults to None.
             show_progress_bar (bool, optional): If True, output a tqdm progress bar. Defaults to True.
+            tensorboard_path (str, optional): If available, write tensorboard log to the specified directory.
         """
         train_dataloader.collate_fn = self.smart_batching_collate
+
+        if logging_steps <= 0:
+            logging_steps = 100
+
+        self.writer = None
+        if tensorboard_path is not None:
+            self.writer = SummaryWriter(tensorboard_path)
 
         if use_amp:
             if is_torch_npu_available():
@@ -261,6 +273,7 @@ class CrossEncoder(PushToHubMixin):
             loss_fct = nn.BCEWithLogitsLoss() if self.config.num_labels == 1 else nn.CrossEntropyLoss()
 
         skip_scheduler = False
+        moving_avg_loss = 0.
         for epoch in trange(epochs, desc="Epoch", disable=not show_progress_bar):
             training_steps = 0
             self.model.zero_grad()
@@ -295,6 +308,11 @@ class CrossEncoder(PushToHubMixin):
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm)
                     optimizer.step()
 
+                moving_avg_loss = 0.99 * moving_avg_loss + 0.01 * loss_value.item()
+                if self.writer and training_steps % logging_steps == 0:
+                    self.writer.add_scalar("training/loss", loss_value.item(), training_steps)
+                    self.writer.add_scalar("training/moving_avg_loss", moving_avg_loss, training_steps)
+
                 optimizer.zero_grad()
 
                 if not skip_scheduler:
@@ -312,6 +330,9 @@ class CrossEncoder(PushToHubMixin):
 
             if evaluator is not None:
                 self._eval_during_training(evaluator, output_path, save_best_model, epoch, -1, callback)
+
+        if self.writer:
+            self.writer.close()
 
     @overload
     def predict(
@@ -557,6 +578,8 @@ class CrossEncoder(PushToHubMixin):
         """Runs evaluation during the training"""
         if evaluator is not None:
             score = evaluator(self, output_path=output_path, epoch=epoch, steps=steps)
+            if self.writer:
+                self.writer.add_scalar("evaluation/score", score, steps)
             if callback is not None:
                 callback(score, epoch, steps)
             if score > self.best_score:
